@@ -66,6 +66,15 @@ type serverConfigReader interface {
 	GetProgressReporter() types.ProgressReporter
 }
 
+// folderLock is a per-model-folder mutex with a holder reference counter. The
+// counter keeps the lock entry alive for as long as goroutines are holding it
+// or waiting on it, so unlocking can never delete a mutex another goroutine
+// still uses.
+type folderLock struct {
+	mu      sync.Mutex
+	holders int
+}
+
 type server struct {
 	config                         serverConfigReader
 	successCount                   int
@@ -76,7 +85,8 @@ type server struct {
 	mapTokenHashToTimeoutStruct    map[string]timeoutStruct
 	mapFolderNameToTokenHash       map[string]string
 	extremeShortTimeoutsForTesting bool
-	locksByFolderName              map[string]*sync.Mutex
+	locksByFolderName              map[string]*folderLock
+	store                          *modelStore
 	builtinRiskRules               types.RiskRules
 	customRiskRules                types.RiskRules
 }
@@ -88,9 +98,17 @@ func RunServer(config serverConfigReader, builtinRiskRules types.RiskRules) {
 		mapTokenHashToTimeoutStruct:    make(map[string]timeoutStruct),
 		mapFolderNameToTokenHash:       make(map[string]string),
 		extremeShortTimeoutsForTesting: false,
-		locksByFolderName:              make(map[string]*sync.Mutex),
+		locksByFolderName:              make(map[string]*folderLock),
+		store:                          newModelStore(config.GetInputFile(), config.GetBackupHistoryFilesToKeep()),
 		builtinRiskRules:               builtinRiskRules,
 	}
+	router := s.newRouter(builtinRiskRules)
+
+	fmt.Println("Threagile is running...")
+	_ = router.Run(":" + strconv.Itoa(s.config.GetServerPort())) // listen and serve on 0.0.0.0:8080 or whatever port was specified
+}
+
+func (s *server) newRouter(builtinRiskRules types.RiskRules) *gin.Engine {
 	router := gin.Default()
 	router.LoadHTMLGlob(filepath.Join(s.config.GetServerFolder(), "static", "*.html")) // <==
 	router.GET("/", func(c *gin.Context) {
@@ -133,7 +151,7 @@ func RunServer(config serverConfigReader, builtinRiskRules types.RiskRules) {
 	})
 	router.GET("/meta/version", func(c *gin.Context) {
 		c.JSON(200, gin.H{
-			"version":         config.GetThreagileVersion(),
+			"version":         s.config.GetThreagileVersion(),
 			"build_timestamp": s.config.GetBuildTimestamp(),
 		})
 	})
@@ -150,7 +168,7 @@ func RunServer(config serverConfigReader, builtinRiskRules types.RiskRules) {
 			"encryption":                   arrayOfStringValues(types.EncryptionStyleValues()),
 			"data_format":                  arrayOfStringValues(types.DataFormatValues()),
 			"protocol":                     arrayOfStringValues(types.ProtocolValues()),
-			"technical_asset_technology":   arrayOfStringValues(types.TechnicalAssetTechnologyValues(config)),
+			"technical_asset_technology":   arrayOfStringValues(types.TechnicalAssetTechnologyValues(s.config)),
 			"technical_asset_machine":      arrayOfStringValues(types.TechnicalAssetMachineValues()),
 			"trust_boundary_type":          arrayOfStringValues(types.TrustBoundaryTypeValues()),
 			"data_breach_probability":      arrayOfStringValues(types.DataBreachProbabilityValues()),
@@ -225,10 +243,10 @@ func RunServer(config serverConfigReader, builtinRiskRules types.RiskRules) {
 	router.PUT("/models/:model-id/shared-runtimes/:shared-runtime-id", s.setSharedRuntime)
 	router.DELETE("/models/:model-id/shared-runtimes/:shared-runtime-id", s.deleteSharedRuntime)
 
-	s.customRiskRules = model.LoadCustomRiskRules(s.config.GetPluginFolder(), s.config.GetRiskRulePlugins(), config.GetProgressReporter())
+	s.customRiskRules = model.LoadCustomRiskRules(s.config.GetPluginFolder(), s.config.GetRiskRulePlugins(), s.config.GetProgressReporter())
+	s.builtinRiskRules = builtinRiskRules
 
-	fmt.Println("Threagile is running...")
-	_ = router.Run(":" + strconv.Itoa(s.config.GetServerPort())) // listen and serve on 0.0.0.0:8080 or whatever port was specified
+	return router
 }
 
 func (s *server) exampleFile(ginContext *gin.Context) {

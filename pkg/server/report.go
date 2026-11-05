@@ -86,10 +86,11 @@ func (s *server) streamResponse(ginContext *gin.Context, responseType responseTy
 		handleErrorInServiceCall(err, ginContext)
 		return
 	}
-	_, yamlText, ok := s.readModel(ginContext, ginContext.Param("model-id"), key, folderNameOfKey)
+	_, yamlText, revision, ok := s.readModel(ginContext, ginContext.Param("model-id"), key, folderNameOfKey)
 	if !ok {
 		return
 	}
+	s.respondRevision(ginContext, revision)
 	tmpModelFile, err := os.CreateTemp(s.config.GetTempFolder(), "threagile-render-*")
 	if err != nil {
 		handleErrorInServiceCall(err, ginContext)

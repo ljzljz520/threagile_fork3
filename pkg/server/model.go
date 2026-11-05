@@ -5,21 +5,14 @@ Copyright © 2023 NAME HERE <EMAIL ADDRESS>
 package server
 
 import (
-	"bytes"
-	"compress/gzip"
-	"crypto/aes"
-	"crypto/cipher"
-	"crypto/rand"
+	"errors"
 	"fmt"
-	"io"
 	"log"
 	"net/http"
 	"os"
 	"path/filepath"
-	"sort"
 	"strconv"
 	"strings"
-	"sync"
 	"time"
 
 	"gopkg.in/yaml.v3"
@@ -77,20 +70,27 @@ trust_boundaries: {}
 shared_runtimes: {}
 individual_risk_categories: {}
 risk_tracking: {}
-diagram_tweak_nodesep: ""
-diagram_tweak_ranksep: ""
+diagram_tweak_nodesep: 0
+diagram_tweak_ranksep: 0
 diagram_tweak_edge_layout: ""
 diagram_tweak_suppress_edge_labels: false
 diagram_tweak_invisible_connections_between_assets: []
 diagram_tweak_same_rank_assets: []`
 
-	ok = s.writeModelYAML(ginContext, aYaml, key, folderNameForModel(folderNameOfKey, aUuid), "New Model Creation", true)
-	if ok {
-		ginContext.JSON(http.StatusCreated, gin.H{
-			"message": "model created",
-			"id":      aUuid,
+	revision, err := s.store.create(folderNameForModel(folderNameOfKey, aUuid), key, aYaml, "New Model Creation")
+	if err != nil {
+		log.Println(err)
+		ginContext.JSON(http.StatusInternalServerError, gin.H{
+			"error": "unable to write model",
 		})
+		return
 	}
+	s.respondRevision(ginContext, revision)
+	ginContext.JSON(http.StatusCreated, gin.H{
+		"message":  "model created",
+		"id":       aUuid,
+		"revision": revision,
+	})
 }
 
 type payloadModels struct {
@@ -127,7 +127,7 @@ func (s *server) listModels(ginContext *gin.Context) { // TODO currently returns
 				})
 				return
 			}
-			aModel, _, ok := s.readModel(ginContext, dirEntry.Name(), key, folderNameOfKey)
+			aModel, _, _, ok := s.readModel(ginContext, dirEntry.Name(), key, folderNameOfKey)
 			if !ok {
 				return
 			}
@@ -191,7 +191,7 @@ func (s *server) setCover(ginContext *gin.Context) {
 	}
 	s.lockFolder(folderNameOfKey)
 	defer s.unlockFolder(folderNameOfKey)
-	modelInput, _, ok := s.readModel(ginContext, ginContext.Param("model-id"), key, folderNameOfKey)
+	modelInput, _, expectedRevision, ok := s.readModelForUpdate(ginContext, ginContext.Param("model-id"), key, folderNameOfKey)
 	if ok {
 		payload := payloadCover{}
 		err := ginContext.BindJSON(&payload)
@@ -207,10 +207,11 @@ func (s *server) setCover(ginContext *gin.Context) {
 		}
 		modelInput.Author.Name = payload.Author.Name
 		modelInput.Author.Homepage = payload.Author.Homepage
-		ok = s.writeModel(ginContext, key, folderNameOfKey, &modelInput, "Cover Update")
+		newRevision, ok := s.writeModel(ginContext, key, folderNameOfKey, &modelInput, "Cover Update", expectedRevision)
 		if ok {
 			ginContext.JSON(http.StatusOK, gin.H{
-				"message": "model updated",
+				"message":  "model updated",
+				"revision": newRevision,
 			})
 		}
 	}
@@ -223,8 +224,9 @@ func (s *server) getCover(ginContext *gin.Context) {
 	}
 	s.lockFolder(folderNameOfKey)
 	defer s.unlockFolder(folderNameOfKey)
-	aModel, _, ok := s.readModel(ginContext, ginContext.Param("model-id"), key, folderNameOfKey)
+	aModel, _, revision, ok := s.readModel(ginContext, ginContext.Param("model-id"), key, folderNameOfKey)
 	if ok {
+		s.respondRevision(ginContext, revision)
 		ginContext.JSON(http.StatusOK, gin.H{
 			"title":  aModel.Title,
 			"date":   aModel.Date,
@@ -247,7 +249,7 @@ func (s *server) setOverview(ginContext *gin.Context) {
 	}
 	s.lockFolder(folderNameOfKey)
 	defer s.unlockFolder(folderNameOfKey)
-	modelInput, _, ok := s.readModel(ginContext, ginContext.Param("model-id"), key, folderNameOfKey)
+	modelInput, _, expectedRevision, ok := s.readModelForUpdate(ginContext, ginContext.Param("model-id"), key, folderNameOfKey)
 	if ok {
 		payload := payloadOverview{}
 		err := ginContext.BindJSON(&payload)
@@ -269,10 +271,11 @@ func (s *server) setOverview(ginContext *gin.Context) {
 		modelInput.BusinessOverview.Images = payload.BusinessOverview.Images
 		modelInput.TechnicalOverview.Description = payload.TechnicalOverview.Description
 		modelInput.TechnicalOverview.Images = payload.TechnicalOverview.Images
-		ok = s.writeModel(ginContext, key, folderNameOfKey, &modelInput, "Overview Update")
+		newRevision, ok := s.writeModel(ginContext, key, folderNameOfKey, &modelInput, "Overview Update", expectedRevision)
 		if ok {
 			ginContext.JSON(http.StatusOK, gin.H{
-				"message": "model updated",
+				"message":  "model updated",
+				"revision": newRevision,
 			})
 		}
 	}
@@ -285,8 +288,9 @@ func (s *server) getOverview(ginContext *gin.Context) {
 	}
 	s.lockFolder(folderNameOfKey)
 	defer s.unlockFolder(folderNameOfKey)
-	aModel, _, ok := s.readModel(ginContext, ginContext.Param("model-id"), key, folderNameOfKey)
+	aModel, _, revision, ok := s.readModel(ginContext, ginContext.Param("model-id"), key, folderNameOfKey)
 	if ok {
+		s.respondRevision(ginContext, revision)
 		ginContext.JSON(http.StatusOK, gin.H{
 			"management_summary_comment": aModel.ManagementSummaryComment,
 			"business_criticality":       aModel.BusinessCriticality,
@@ -305,7 +309,7 @@ func (s *server) setAbuseCases(ginContext *gin.Context) {
 	}
 	s.lockFolder(folderNameOfKey)
 	defer s.unlockFolder(folderNameOfKey)
-	modelInput, _, ok := s.readModel(ginContext, ginContext.Param("model-id"), key, folderNameOfKey)
+	modelInput, _, expectedRevision, ok := s.readModelForUpdate(ginContext, ginContext.Param("model-id"), key, folderNameOfKey)
 	if ok {
 		payload := payloadAbuseCases{}
 		err := ginContext.BindJSON(&payload)
@@ -317,10 +321,11 @@ func (s *server) setAbuseCases(ginContext *gin.Context) {
 			return
 		}
 		modelInput.AbuseCases = payload
-		ok = s.writeModel(ginContext, key, folderNameOfKey, &modelInput, "Abuse Cases Update")
+		newRevision, ok := s.writeModel(ginContext, key, folderNameOfKey, &modelInput, "Abuse Cases Update", expectedRevision)
 		if ok {
 			ginContext.JSON(http.StatusOK, gin.H{
-				"message": "model updated",
+				"message":  "model updated",
+				"revision": newRevision,
 			})
 		}
 	}
@@ -333,8 +338,9 @@ func (s *server) getAbuseCases(ginContext *gin.Context) {
 	}
 	s.lockFolder(folderNameOfKey)
 	defer s.unlockFolder(folderNameOfKey)
-	aModel, _, ok := s.readModel(ginContext, ginContext.Param("model-id"), key, folderNameOfKey)
+	aModel, _, revision, ok := s.readModel(ginContext, ginContext.Param("model-id"), key, folderNameOfKey)
 	if ok {
+		s.respondRevision(ginContext, revision)
 		ginContext.JSON(http.StatusOK, aModel.AbuseCases)
 	}
 }
@@ -348,7 +354,7 @@ func (s *server) setSecurityRequirements(ginContext *gin.Context) {
 	}
 	s.lockFolder(folderNameOfKey)
 	defer s.unlockFolder(folderNameOfKey)
-	modelInput, _, ok := s.readModel(ginContext, ginContext.Param("model-id"), key, folderNameOfKey)
+	modelInput, _, expectedRevision, ok := s.readModelForUpdate(ginContext, ginContext.Param("model-id"), key, folderNameOfKey)
 	if ok {
 		payload := payloadSecurityRequirements{}
 		err := ginContext.BindJSON(&payload)
@@ -360,10 +366,11 @@ func (s *server) setSecurityRequirements(ginContext *gin.Context) {
 			return
 		}
 		modelInput.SecurityRequirements = payload
-		ok = s.writeModel(ginContext, key, folderNameOfKey, &modelInput, "Security Requirements Update")
+		newRevision, ok := s.writeModel(ginContext, key, folderNameOfKey, &modelInput, "Security Requirements Update", expectedRevision)
 		if ok {
 			ginContext.JSON(http.StatusOK, gin.H{
-				"message": "model updated",
+				"message":  "model updated",
+				"revision": newRevision,
 			})
 		}
 	}
@@ -376,8 +383,9 @@ func (s *server) getSecurityRequirements(ginContext *gin.Context) {
 	}
 	s.lockFolder(folderNameOfKey)
 	defer s.unlockFolder(folderNameOfKey)
-	aModel, _, ok := s.readModel(ginContext, ginContext.Param("model-id"), key, folderNameOfKey)
+	aModel, _, revision, ok := s.readModel(ginContext, ginContext.Param("model-id"), key, folderNameOfKey)
 	if ok {
+		s.respondRevision(ginContext, revision)
 		ginContext.JSON(http.StatusOK, aModel.SecurityRequirements)
 	}
 }
@@ -404,8 +412,9 @@ func (s *server) getDataAssets(ginContext *gin.Context) {
 	}
 	s.lockFolder(folderNameOfKey)
 	defer s.unlockFolder(folderNameOfKey)
-	aModel, _, ok := s.readModel(ginContext, ginContext.Param("model-id"), key, folderNameOfKey)
+	aModel, _, revision, ok := s.readModel(ginContext, ginContext.Param("model-id"), key, folderNameOfKey)
 	if ok {
+		s.respondRevision(ginContext, revision)
 		ginContext.JSON(http.StatusOK, aModel.DataAssets)
 	}
 }
@@ -417,8 +426,9 @@ func (s *server) getDataAsset(ginContext *gin.Context) {
 	}
 	s.lockFolder(folderNameOfKey)
 	defer s.unlockFolder(folderNameOfKey)
-	modelInput, _, ok := s.readModel(ginContext, ginContext.Param("model-id"), key, folderNameOfKey)
+	modelInput, _, revision, ok := s.readModel(ginContext, ginContext.Param("model-id"), key, folderNameOfKey)
 	if ok {
+		s.respondRevision(ginContext, revision)
 		// yes, here keyed by title in YAML for better readability in the YAML file itself
 		for title, dataAsset := range modelInput.DataAssets {
 			if dataAsset.ID == ginContext.Param("data-asset-id") {
@@ -441,7 +451,7 @@ func (s *server) deleteDataAsset(ginContext *gin.Context) {
 	}
 	s.lockFolder(folderNameOfKey)
 	defer s.unlockFolder(folderNameOfKey)
-	modelInput, _, ok := s.readModel(ginContext, ginContext.Param("model-id"), key, folderNameOfKey)
+	modelInput, _, expectedRevision, ok := s.readModelForUpdate(ginContext, ginContext.Param("model-id"), key, folderNameOfKey)
 	if ok {
 		referencesDeleted := false
 		// yes, here keyed by title in YAML for better readability in the YAML file itself
@@ -520,11 +530,12 @@ func (s *server) deleteDataAsset(ginContext *gin.Context) {
 				}
 				// remove it itself
 				delete(modelInput.DataAssets, title)
-				ok = s.writeModel(ginContext, key, folderNameOfKey, &modelInput, "Data Asset Deletion")
+				newRevision, ok := s.writeModel(ginContext, key, folderNameOfKey, &modelInput, "Data Asset Deletion", expectedRevision)
 				if ok {
 					ginContext.JSON(http.StatusOK, gin.H{
 						"message":            "data asset deleted",
 						"id":                 dataAsset.ID,
+						"revision":           newRevision,
 						"references_deleted": referencesDeleted, // in order to signal to clients, that other model parts might've been deleted as well
 					})
 				}
@@ -544,7 +555,7 @@ func (s *server) setDataAsset(ginContext *gin.Context) {
 	}
 	s.lockFolder(folderNameOfKey)
 	defer s.unlockFolder(folderNameOfKey)
-	modelInput, _, ok := s.readModel(ginContext, ginContext.Param("model-id"), key, folderNameOfKey)
+	modelInput, _, expectedRevision, ok := s.readModelForUpdate(ginContext, ginContext.Param("model-id"), key, folderNameOfKey)
 	if ok {
 		// yes, here keyed by title in YAML for better readability in the YAML file itself
 		for title, dataAsset := range modelInput.DataAssets {
@@ -614,11 +625,12 @@ func (s *server) setDataAsset(ginContext *gin.Context) {
 						}
 					}
 				}
-				ok = s.writeModel(ginContext, key, folderNameOfKey, &modelInput, "Data Asset Update")
+				newRevision, ok := s.writeModel(ginContext, key, folderNameOfKey, &modelInput, "Data Asset Update", expectedRevision)
 				if ok {
 					ginContext.JSON(http.StatusOK, gin.H{
 						"message":    "data asset updated",
 						"id":         dataAssetInput.ID,
+						"revision":   newRevision,
 						"id_changed": idChanged, // in order to signal to clients, that other model parts might've received updates as well and should be reloaded
 					})
 				}
@@ -638,7 +650,7 @@ func (s *server) createNewDataAsset(ginContext *gin.Context) {
 	}
 	s.lockFolder(folderNameOfKey)
 	defer s.unlockFolder(folderNameOfKey)
-	modelInput, _, ok := s.readModel(ginContext, ginContext.Param("model-id"), key, folderNameOfKey)
+	modelInput, _, expectedRevision, ok := s.readModelForUpdate(ginContext, ginContext.Param("model-id"), key, folderNameOfKey)
 	if ok {
 		payload := payloadDataAsset{}
 		err := ginContext.BindJSON(&payload)
@@ -673,11 +685,12 @@ func (s *server) createNewDataAsset(ginContext *gin.Context) {
 			modelInput.DataAssets = make(map[string]input.DataAsset)
 		}
 		modelInput.DataAssets[payload.Title] = dataAssetInput
-		ok = s.writeModel(ginContext, key, folderNameOfKey, &modelInput, "Data Asset Creation")
+		newRevision, ok := s.writeModel(ginContext, key, folderNameOfKey, &modelInput, "Data Asset Creation", expectedRevision)
 		if ok {
 			ginContext.JSON(http.StatusOK, gin.H{
-				"message": "data asset created",
-				"id":      dataAssetInput.ID,
+				"message":  "data asset created",
+				"id":       dataAssetInput.ID,
+				"revision": newRevision,
 			})
 		}
 	}
@@ -732,8 +745,9 @@ func (s *server) getTrustBoundaries(ginContext *gin.Context) {
 	}
 	s.lockFolder(folderNameOfKey)
 	defer s.unlockFolder(folderNameOfKey)
-	aModel, _, ok := s.readModel(ginContext, ginContext.Param("model-id"), key, folderNameOfKey)
+	aModel, _, revision, ok := s.readModel(ginContext, ginContext.Param("model-id"), key, folderNameOfKey)
 	if ok {
+		s.respondRevision(ginContext, revision)
 		ginContext.JSON(http.StatusOK, aModel.TrustBoundaries)
 	}
 }
@@ -753,7 +767,7 @@ func (s *server) setSharedRuntime(ginContext *gin.Context) {
 	}
 	s.lockFolder(folderNameOfKey)
 	defer s.unlockFolder(folderNameOfKey)
-	modelInput, _, ok := s.readModel(ginContext, ginContext.Param("model-id"), key, folderNameOfKey)
+	modelInput, _, expectedRevision, ok := s.readModelForUpdate(ginContext, ginContext.Param("model-id"), key, folderNameOfKey)
 	if ok {
 		// yes, here keyed by title in YAML for better readability in the YAML file itself
 		for title, sharedRuntime := range modelInput.SharedRuntimes {
@@ -788,11 +802,12 @@ func (s *server) setSharedRuntime(ginContext *gin.Context) {
 						}
 					}
 				}
-				ok = s.writeModel(ginContext, key, folderNameOfKey, &modelInput, "Shared Runtime Update")
+				newRevision, ok := s.writeModel(ginContext, key, folderNameOfKey, &modelInput, "Shared Runtime Update", expectedRevision)
 				if ok {
 					ginContext.JSON(http.StatusOK, gin.H{
 						"message":    "shared runtime updated",
 						"id":         sharedRuntimeInput.ID,
+						"revision":   newRevision,
 						"id_changed": idChanged, // in order to signal to clients, that other model parts might've received updates as well and should be reloaded
 					})
 				}
@@ -812,8 +827,9 @@ func (s *server) getSharedRuntime(ginContext *gin.Context) {
 	}
 	s.lockFolder(folderNameOfKey)
 	defer s.unlockFolder(folderNameOfKey)
-	modelInput, _, ok := s.readModel(ginContext, ginContext.Param("model-id"), key, folderNameOfKey)
+	modelInput, _, revision, ok := s.readModel(ginContext, ginContext.Param("model-id"), key, folderNameOfKey)
 	if ok {
+		s.respondRevision(ginContext, revision)
 		// yes, here keyed by title in YAML for better readability in the YAML file itself
 		for title, sharedRuntime := range modelInput.SharedRuntimes {
 			if sharedRuntime.ID == ginContext.Param("shared-runtime-id") {
@@ -836,7 +852,7 @@ func (s *server) createNewSharedRuntime(ginContext *gin.Context) {
 	}
 	s.lockFolder(folderNameOfKey)
 	defer s.unlockFolder(folderNameOfKey)
-	modelInput, _, ok := s.readModel(ginContext, ginContext.Param("model-id"), key, folderNameOfKey)
+	modelInput, _, expectedRevision, ok := s.readModelForUpdate(ginContext, ginContext.Param("model-id"), key, folderNameOfKey)
 	if ok {
 		payload := payloadSharedRuntime{}
 		err := ginContext.BindJSON(&payload)
@@ -877,11 +893,12 @@ func (s *server) createNewSharedRuntime(ginContext *gin.Context) {
 			modelInput.SharedRuntimes = make(map[string]input.SharedRuntime)
 		}
 		modelInput.SharedRuntimes[payload.Title] = sharedRuntimeInput
-		ok = s.writeModel(ginContext, key, folderNameOfKey, &modelInput, "Shared Runtime Creation")
+		newRevision, ok := s.writeModel(ginContext, key, folderNameOfKey, &modelInput, "Shared Runtime Creation", expectedRevision)
 		if ok {
 			ginContext.JSON(http.StatusOK, gin.H{
-				"message": "shared runtime created",
-				"id":      sharedRuntimeInput.ID,
+				"message":  "shared runtime created",
+				"id":       sharedRuntimeInput.ID,
+				"revision": newRevision,
 			})
 		}
 	}
@@ -920,7 +937,7 @@ func (s *server) deleteSharedRuntime(ginContext *gin.Context) {
 	}
 	s.lockFolder(folderNameOfKey)
 	defer s.unlockFolder(folderNameOfKey)
-	modelInput, _, ok := s.readModel(ginContext, ginContext.Param("model-id"), key, folderNameOfKey)
+	modelInput, _, expectedRevision, ok := s.readModelForUpdate(ginContext, ginContext.Param("model-id"), key, folderNameOfKey)
 	if ok {
 		referencesDeleted := false
 		// yes, here keyed by title in YAML for better readability in the YAML file itself
@@ -941,11 +958,12 @@ func (s *server) deleteSharedRuntime(ginContext *gin.Context) {
 				}
 				// remove it itself
 				delete(modelInput.SharedRuntimes, title)
-				ok = s.writeModel(ginContext, key, folderNameOfKey, &modelInput, "Shared Runtime Deletion")
+				newRevision, ok := s.writeModel(ginContext, key, folderNameOfKey, &modelInput, "Shared Runtime Deletion", expectedRevision)
 				if ok {
 					ginContext.JSON(http.StatusOK, gin.H{
 						"message":            "shared runtime deleted",
 						"id":                 sharedRuntime.ID,
+						"revision":           newRevision,
 						"references_deleted": referencesDeleted, // in order to signal to clients, that other model parts might've been deleted as well
 					})
 				}
@@ -965,96 +983,147 @@ func (s *server) getSharedRuntimes(ginContext *gin.Context) {
 	}
 	s.lockFolder(folderNameOfKey)
 	defer s.unlockFolder(folderNameOfKey)
-	aModel, _, ok := s.readModel(ginContext, ginContext.Param("model-id"), key, folderNameOfKey)
+	aModel, _, revision, ok := s.readModel(ginContext, ginContext.Param("model-id"), key, folderNameOfKey)
 	if ok {
+		s.respondRevision(ginContext, revision)
 		ginContext.JSON(http.StatusOK, aModel.SharedRuntimes)
 	}
 }
 
-func (s *server) readModel(ginContext *gin.Context, modelUUID string, key []byte, folderNameOfKey string) (modelInputResult input.Model, yamlText string, ok bool) {
+// readModel loads and decrypts the current model. It additionally returns the
+// model's revision identifier, which clients must echo on subsequent updates.
+// When the model file is damaged (short write, interrupted process, ...), this
+// transparently recovers the newest valid history backup.
+func (s *server) readModel(ginContext *gin.Context, modelUUID string, key []byte, folderNameOfKey string) (modelInputResult input.Model, yamlText string, revision string, ok bool) {
 	modelFolder, ok := s.checkModelFolder(ginContext, modelUUID, folderNameOfKey)
 	if !ok {
-		return modelInputResult, yamlText, false
+		return modelInputResult, yamlText, "", false
 	}
-	cryptoKey := generateKeyFromAlreadyStrongRandomInput(key)
-	block, err := aes.NewCipher(cryptoKey)
+	loaded, err := s.store.load(modelFolder, key)
 	if err != nil {
 		log.Println(err)
 		ginContext.JSON(http.StatusInternalServerError, gin.H{
 			"error": "unable to open model",
 		})
-		return modelInputResult, yamlText, false
+		return modelInputResult, yamlText, "", false
 	}
-	aesGcm, err := cipher.NewGCM(block)
-	if err != nil {
-		log.Println(err)
-		ginContext.JSON(http.StatusInternalServerError, gin.H{
-			"error": "unable to open model",
-		})
-		return modelInputResult, yamlText, false
-	}
-
-	fileBytes, err := os.ReadFile(filepath.Clean(filepath.Join(modelFolder, s.config.GetInputFile())))
-	if err != nil {
-		log.Println(err)
-		ginContext.JSON(http.StatusInternalServerError, gin.H{
-			"error": "unable to open model",
-		})
-		return modelInputResult, yamlText, false
-	}
-
-	nonce := fileBytes[0:12]
-	ciphertext := fileBytes[12:]
-	plaintext, err := aesGcm.Open(nil, nonce, ciphertext, nil) // #nosec G407 // false positive The nounce is read from file for decryption not encryption
-	if err != nil {
-		log.Println(err)
-		ginContext.JSON(http.StatusInternalServerError, gin.H{
-			"error": "unable to open model",
-		})
-		return modelInputResult, yamlText, false
-	}
-
-	r, err := gzip.NewReader(bytes.NewReader(plaintext))
-	if err != nil {
-		log.Println(err)
-		ginContext.JSON(http.StatusInternalServerError, gin.H{
-			"error": "unable to open model",
-		})
-		return modelInputResult, yamlText, false
-	}
-	buf := new(bytes.Buffer)
-	_, _ = buf.ReadFrom(r)
-	modelInput := new(input.Model).Defaults()
-	yamlBytes := buf.Bytes()
-	err = yaml.Unmarshal(yamlBytes, &modelInput)
-	if err != nil {
-		log.Println(err)
-		ginContext.JSON(http.StatusInternalServerError, gin.H{
-			"error": "unable to open model",
-		})
-		return modelInputResult, yamlText, false
-	}
-	return *modelInput, string(yamlBytes), true
+	return loaded.Model, loaded.YAML, loaded.Revision, true
 }
 
-func (s *server) writeModel(ginContext *gin.Context, key []byte, folderNameOfKey string, modelInput *input.Model, changeReasonForHistory string) (ok bool) {
-	modelFolder, ok := s.checkModelFolder(ginContext, ginContext.Param("model-id"), folderNameOfKey)
-	if ok {
-		modelInput.ThreagileVersion = s.config.GetThreagileVersion()
-		yamlBytes, err := yaml.Marshal(modelInput)
-		if err != nil {
-			log.Println(err)
-			ginContext.JSON(http.StatusInternalServerError, gin.H{
-				"error": "unable to write model",
-			})
-			return false
-		}
-		/*
-			yamlBytes = model.ReformatYAML(yamlBytes)
-		*/
-		return s.writeModelYAML(ginContext, string(yamlBytes), key, modelFolder, changeReasonForHistory, false)
+// etagOf wraps a revision as a quoted HTTP ETag value.
+func etagOf(revision string) string {
+	return "\"" + revision + "\""
+}
+
+// respondRevision exposes the current model revision to clients via the
+// standard ETag header plus a convenience X-Revision header.
+func (s *server) respondRevision(ginContext *gin.Context, revision string) {
+	ginContext.Header("ETag", etagOf(revision))
+	ginContext.Header("X-Revision", revision)
+}
+
+// expectedRevision reads and normalizes the client's optimistic-locking
+// precondition. It accepts the standard If-Match header (quoted or unquoted,
+// with optional W/ weak prefix) as well as an X-Expected-Revision header.
+func (s *server) expectedRevision(ginContext *gin.Context) (expected string, ok bool) {
+	value := strings.TrimSpace(ginContext.GetHeader("If-Match"))
+	if value == "" {
+		value = strings.TrimSpace(ginContext.GetHeader("X-Expected-Revision"))
 	}
-	return false
+	if value == "" {
+		ginContext.JSON(http.StatusPreconditionRequired, gin.H{
+			"error": "missing revision precondition: read the model first and send its revision via the If-Match header",
+		})
+		return "", false
+	}
+	if value == "*" {
+		ginContext.JSON(http.StatusBadRequest, gin.H{
+			"error": "wildcard If-Match precondition is not supported: send the exact revision received on read",
+		})
+		return "", false
+	}
+	value = strings.TrimSpace(strings.TrimPrefix(value, "W/"))
+	value = strings.Trim(value, "\"")
+	value = strings.TrimSpace(value)
+	if value == "" {
+		ginContext.JSON(http.StatusBadRequest, gin.H{
+			"error": "invalid If-Match revision header",
+		})
+		return "", false
+	}
+	return value, true
+}
+
+func (s *server) conflictResponse(ginContext *gin.Context, currentRevision string) {
+	s.respondRevision(ginContext, currentRevision)
+	ginContext.JSON(http.StatusConflict, gin.H{
+		"error":            "the model was changed in the meantime: your edit is based on an outdated revision, please re-read the current revision and re-apply your changes",
+		"current_revision": currentRevision,
+	})
+}
+
+// readModelForUpdate combines the revision precondition check with the model
+// read: requests without an If-Match revision get 428, requests based on a
+// stale revision get 409 (including the current revision to re-read).
+func (s *server) readModelForUpdate(ginContext *gin.Context, modelUUID string, key []byte, folderNameOfKey string) (modelInputResult input.Model, yamlText string, expectedRevision string, ok bool) {
+	expected, ok := s.expectedRevision(ginContext)
+	if !ok {
+		return modelInputResult, yamlText, "", false
+	}
+	modelInputResult, yamlText, revision, ok := s.readModel(ginContext, modelUUID, key, folderNameOfKey)
+	if !ok {
+		return modelInputResult, yamlText, "", false
+	}
+	if revision != expected {
+		s.conflictResponse(ginContext, revision)
+		return modelInputResult, yamlText, "", false
+	}
+	return modelInputResult, yamlText, expected, true
+}
+
+func (s *server) writeModel(ginContext *gin.Context, key []byte, folderNameOfKey string, modelInput *input.Model, changeReasonForHistory string, expectedRevision string) (newRevision string, ok bool) {
+	modelFolder, ok := s.checkModelFolder(ginContext, ginContext.Param("model-id"), folderNameOfKey)
+	if !ok {
+		return "", false
+	}
+	modelInput.ThreagileVersion = s.config.GetThreagileVersion()
+	yamlBytes, err := yaml.Marshal(modelInput)
+	if err != nil {
+		log.Println(err)
+		ginContext.JSON(http.StatusInternalServerError, gin.H{
+			"error": "unable to write model",
+		})
+		return "", false
+	}
+	/*
+		yamlBytes = model.ReformatYAML(yamlBytes)
+	*/
+	return s.commitYAML(ginContext, key, modelFolder, string(yamlBytes), changeReasonForHistory, expectedRevision)
+}
+
+// commitYAML runs the unified atomic revision commit and maps storage errors
+// to HTTP responses. Only ErrStaleRevision can occur here when the folder lock
+// did not serialize access (e.g. external modifications).
+func (s *server) commitYAML(ginContext *gin.Context, key []byte, modelFolder string, yamlText string, changeReasonForHistory string, expectedRevision string) (newRevision string, ok bool) {
+	newRevision, err := s.store.commit(modelFolder, key, yamlText, changeReasonForHistory, expectedRevision)
+	if err != nil {
+		if errors.Is(err, ErrStaleRevision) {
+			// report the revision actually on disk so the client can re-read it
+			if loaded, loadErr := s.store.load(modelFolder, key); loadErr == nil {
+				s.conflictResponse(ginContext, loaded.Revision)
+				return "", false
+			}
+			s.conflictResponse(ginContext, "")
+			return "", false
+		}
+		log.Println(err)
+		ginContext.JSON(http.StatusInternalServerError, gin.H{
+			"error": "unable to write model",
+		})
+		return "", false
+	}
+	s.respondRevision(ginContext, newRevision)
+	return newRevision, true
 }
 
 func (s *server) checkModelFolder(ginContext *gin.Context, modelUUID string, folderNameOfKey string) (modelFolder string, ok bool) {
@@ -1082,8 +1151,9 @@ func (s *server) getModel(ginContext *gin.Context) {
 	}
 	s.lockFolder(folderNameOfKey)
 	defer s.unlockFolder(folderNameOfKey)
-	_, yamlText, ok := s.readModel(ginContext, ginContext.Param("model-id"), key, folderNameOfKey)
+	_, yamlText, revision, ok := s.readModel(ginContext, ginContext.Param("model-id"), key, folderNameOfKey)
 	if ok {
+		s.respondRevision(ginContext, revision)
 		tmpResultFile, err := os.CreateTemp(s.config.GetTempFolder(), "threagile-*.yaml")
 		if err != nil {
 			handleErrorInServiceCall(err, ginContext)
@@ -1102,7 +1172,8 @@ func (s *server) getModel(ginContext *gin.Context) {
 	}
 }
 
-// fully replaces threagile.yaml in sub-folder given by UUID
+// fully replaces threagile.yaml in sub-folder given by UUID, but only when the
+// client still holds the current revision (If-Match)
 func (s *server) importModel(ginContext *gin.Context) {
 	folderNameOfKey, key, ok := s.checkTokenToFolderName(ginContext)
 	if !ok {
@@ -1112,19 +1183,38 @@ func (s *server) importModel(ginContext *gin.Context) {
 	defer s.unlockFolder(folderNameOfKey)
 
 	aUuid := ginContext.Param("model-id") // UUID is syntactically validated in readModel+checkModelFolder (next line) via uuid.Parse(modelUUID)
-	_, _, ok = s.readModel(ginContext, aUuid, key, folderNameOfKey)
+	expectedRevision, ok := s.expectedRevision(ginContext)
+	if !ok {
+		return
+	}
+	modelFolder, ok := s.checkModelFolder(ginContext, aUuid, folderNameOfKey)
+	if !ok {
+		return
+	}
+	loaded, err := s.store.load(modelFolder, key)
+	if err != nil {
+		log.Println(err)
+		ginContext.JSON(http.StatusInternalServerError, gin.H{
+			"error": "unable to open model",
+		})
+		return
+	}
+	if loaded.Revision != expectedRevision {
+		s.conflictResponse(ginContext, loaded.Revision)
+		return
+	}
+	// first analyze it simply by executing the full risk process (just discard the result) to ensure that everything would work
+	yamlContent, ok := s.execute(ginContext, true)
+	if !ok {
+		return
+	}
+	// if we're here, then no problem was raised, so ok to atomically commit it as a new revision
+	newRevision, ok := s.commitYAML(ginContext, key, modelFolder, string(yamlContent), "Model Import", expectedRevision)
 	if ok {
-		// first analyze it simply by executing the full risk process (just discard the result) to ensure that everything would work
-		yamlContent, ok := s.execute(ginContext, true)
-		if ok {
-			// if we're here, then no problem was raised, so ok to proceed
-			ok = s.writeModelYAML(ginContext, string(yamlContent), key, folderNameForModel(folderNameOfKey, aUuid), "Model Import", false)
-			if ok {
-				ginContext.JSON(http.StatusCreated, gin.H{
-					"message": "model imported",
-				})
-			}
-		}
+		ginContext.JSON(http.StatusCreated, gin.H{
+			"message":  "model imported",
+			"revision": newRevision,
+		})
 	}
 }
 
@@ -1156,10 +1246,11 @@ func (s *server) analyzeModelOnServerDirectly(ginContext *gin.Context) {
 		return
 	}
 
-	_, yamlText, ok := s.readModel(ginContext, ginContext.Param("model-id"), key, folderNameOfKey)
+	_, yamlText, revision, ok := s.readModel(ginContext, ginContext.Param("model-id"), key, folderNameOfKey)
 	if !ok {
 		return
 	}
+	s.respondRevision(ginContext, revision)
 	tmpModelFile, err := os.CreateTemp(s.config.GetTempFolder(), "threagile-direct-analyze-*")
 	if err != nil {
 		handleErrorInServiceCall(err, ginContext)
@@ -1218,139 +1309,37 @@ func (s *server) analyzeModelOnServerDirectly(ginContext *gin.Context) {
 	ginContext.FileAttachment(tmpResultFile.Name(), "threagile-result.zip")
 }
 
-func (s *server) writeModelYAML(ginContext *gin.Context, yaml string, key []byte, modelFolder string, changeReasonForHistory string, skipBackup bool) (ok bool) {
-	if s.config.GetVerbose() {
-		fmt.Println("about to write " + strconv.Itoa(len(yaml)) + " bytes of yaml into model folder: " + modelFolder)
-	}
-	var b bytes.Buffer
-	w := gzip.NewWriter(&b)
-	_, _ = w.Write([]byte(yaml))
-	_ = w.Close()
-	plaintext := b.Bytes()
-	cryptoKey := generateKeyFromAlreadyStrongRandomInput(key)
-	block, err := aes.NewCipher(cryptoKey)
-	if err != nil {
-		log.Println(err)
-		ginContext.JSON(http.StatusInternalServerError, gin.H{
-			"error": "unable to write model",
-		})
-		return false
-	}
-	// Never use more than 2^32 random nonces with a given key because of the risk of a repeat.
-	nonce := make([]byte, 12)
-	if _, err := io.ReadFull(rand.Reader, nonce); err != nil {
-		log.Println(err)
-		ginContext.JSON(http.StatusInternalServerError, gin.H{
-			"error": "unable to write model",
-		})
-		return false
-	}
-	aesGcm, err := cipher.NewGCM(block)
-	if err != nil {
-		log.Println(err)
-		ginContext.JSON(http.StatusInternalServerError, gin.H{
-			"error": "unable to write model",
-		})
-		return false
-	}
-	ciphertext := aesGcm.Seal(nil, nonce, plaintext, nil) // #nosec G407 // The nounce is read from random so it shoul be random each run
-	if !skipBackup {
-		err = s.backupModelToHistory(modelFolder, changeReasonForHistory)
-		if err != nil {
-			log.Println(err)
-			ginContext.JSON(http.StatusInternalServerError, gin.H{
-				"error": "unable to write model",
-			})
-			return false
-		}
-	}
-	f, err := os.Create(filepath.Clean(filepath.Join(modelFolder, s.config.GetInputFile())))
-	if err != nil {
-		log.Println(err)
-		ginContext.JSON(http.StatusInternalServerError, gin.H{
-			"error": "unable to write model",
-		})
-		return false
-	}
-	_, _ = f.Write(nonce)
-	_, _ = f.Write(ciphertext)
-	_ = f.Close()
-	return true
-}
-
+// lockFolder acquires the per-model-folder mutex. The map lookup is protected
+// by the global lock, but blocking on the folder mutex happens without holding
+// the global lock so different folders cannot serialize each other. The lock
+// entry is reference counted and only removed once its last holder released
+// it, fixing the previous lifecycle bug where unlocking deleted a mutex
+// another goroutine was already waiting on.
 func (s *server) lockFolder(folderName string) {
 	s.globalLock.Lock()
-	defer s.globalLock.Unlock()
-	_, exists := s.locksByFolderName[folderName]
+	lock, exists := s.locksByFolderName[folderName]
 	if !exists {
-		s.locksByFolderName[folderName] = &sync.Mutex{}
+		lock = &folderLock{}
+		s.locksByFolderName[folderName] = lock
 	}
-	s.locksByFolderName[folderName].Lock()
+	lock.holders++
+	s.globalLock.Unlock()
+	lock.mu.Lock()
 }
 
 func (s *server) unlockFolder(folderName string) {
-	if _, exists := s.locksByFolderName[folderName]; exists {
-		s.locksByFolderName[folderName].Unlock()
+	s.globalLock.Lock()
+	defer s.globalLock.Unlock()
+	lock, exists := s.locksByFolderName[folderName]
+	if !exists {
+		log.Printf("warning: unlock of folder without active lock: %q", folderName)
+		return
+	}
+	lock.mu.Unlock()
+	lock.holders--
+	if lock.holders <= 0 {
 		delete(s.locksByFolderName, folderName)
 	}
-}
-
-func (s *server) backupModelToHistory(modelFolder string, changeReasonForHistory string) (err error) {
-	// Sanitize inputs to prevent path traversal
-	safeReason := filepath.Base(changeReasonForHistory)
-	baseDir, resolveErr := filepath.Abs(s.config.GetDataFolder())
-	if resolveErr != nil {
-		return fmt.Errorf("failed to resolve data folder: %w", resolveErr)
-	}
-	cleanModelFolder, resolveErr := filepath.Abs(modelFolder)
-	if resolveErr != nil {
-		return fmt.Errorf("failed to resolve model folder: %w", resolveErr)
-	}
-	if !strings.HasPrefix(cleanModelFolder, baseDir) {
-		return fmt.Errorf("model folder %q is outside data directory", modelFolder)
-	}
-	historyFolder := filepath.Join(cleanModelFolder, "history")
-	if _, err := os.Stat(historyFolder); os.IsNotExist(err) {
-		err = os.Mkdir(historyFolder, 0700)
-		if err != nil {
-			return err
-		}
-	}
-	inputFile := filepath.Join(cleanModelFolder, filepath.Base(s.config.GetInputFile()))
-	inputModel, err := os.ReadFile(filepath.Clean(inputFile))
-	if err != nil {
-		return err
-	}
-	historyFile := filepath.Join(historyFolder, time.Now().Format("2006-01-02 15:04:05")+" "+safeReason+".backup")
-	err = os.WriteFile(historyFile, inputModel, 0400) // #nosec G703
-	if err != nil {
-		return err
-	}
-	// now delete any old files if over limit to keep
-	files, err := os.ReadDir(filepath.Clean(historyFolder))
-	if err != nil {
-		return err
-	}
-	if len(files) > s.config.GetBackupHistoryFilesToKeep() {
-		requiredToDelete := len(files) - s.config.GetBackupHistoryFilesToKeep()
-		sort.Slice(files, func(i, j int) bool {
-			return files[i].Name() < files[j].Name()
-		})
-		for _, file := range files {
-			requiredToDelete--
-			if file.Name() != filepath.Clean(file.Name()) {
-				return fmt.Errorf("weird file name %v", file.Name())
-			}
-			err = os.Remove(filepath.Clean(filepath.Join(historyFolder, file.Name())))
-			if err != nil {
-				return err
-			}
-			if requiredToDelete <= 0 {
-				break
-			}
-		}
-	}
-	return
 }
 
 func folderNameForModel(folderNameOfKey string, uuid string) string {
